@@ -331,6 +331,7 @@ def handle_image_message(event):
   "trans_date": "วันที่ทำรายการ",
   "trans_time": "เวลาทำรายการ",
   "ref_no": "เลขที่อ้างอิง/รหัสรายการ",
+  "branch": "ชื่อสาขาหรือสถานที่ (หากมีระบุในสลิป)",
   "raw_text": "ข้อความสำคัญทั้งหมดที่อ่านได้"
 }
 
@@ -406,8 +407,10 @@ def handle_image_message(event):
                     "raw_text": "ไม่มีข้อความ",
                 }
 
-            # แนบชื่อสาขาลงในข้อมูล
-            parsed_data["branch"] = branch_name
+            # แนบชื่อสาขา: ถ้ามีสาขาจากคำสั่ง #รวม ให้ใช้ก่อน ถ้าไม่มีให้ใช้ที่ AI ตรวจพบจากสลิป
+            detected_branch = parsed_data.get("branch", "") if isinstance(parsed_data, dict) else ""
+            final_branch = branch_name if branch_name else detected_branch
+            parsed_data["branch"] = final_branch or "-"
 
             # 3. ถ้าเป็นสลิปโอนเงิน และกำลังอยู่ใน session #รวม ให้นับยอดเงินสะสมไว้
             if parsed_data.get("category") == "สลิปโอนเงิน" and current_session:
