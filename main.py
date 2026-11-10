@@ -47,6 +47,21 @@ gemini_client = genai.Client(api_key=GEMINI_API_KEY or "")
 
 app = FastAPI(title="LINE Bot OCR to Google Sheets with Batching")
 
+# บันทึกประวัติ Event ล่าสุด 50 รายการ สำหรับตรวจสอบผ่าน /debug
+recent_logs = []
+
+
+def log_event(action: str, detail: str):
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    entry = f"[{timestamp}] [{action}] {detail}"
+    recent_logs.append(entry)
+    if len(recent_logs) > 50:
+        recent_logs.pop(0)
+    try:
+        print(entry)
+    except Exception:
+        pass
+
 # ==========================================
 # ระบบจัดการ Session สะสมยอดสลิป (SQLite)
 # ==========================================
@@ -176,8 +191,9 @@ def reply_line_message(reply_token: str, message_text: str):
                     messages=[TextMessage(text=message_text)],
                 )
             )
+        log_event("REPLY_OK", f"ตอบกลับสำเร็จ: {message_text[:40]}...")
     except Exception as e:
-        print(f"[LINE Reply Error] {e}")
+        log_event("REPLY_ERROR", f"ตอบกลับไม่สำเร็จ: {e}")
 
 
 def send_to_google_sheet(data: dict):
@@ -205,6 +221,22 @@ def read_root():
     }
 
 
+@app.get("/debug")
+def read_debug():
+    """ดู Log เหตุการณ์ล่าสุดที่ยิงเข้ามายัง Webhook"""
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT source_id, branch, slips_json FROM slip_sessions")
+        sessions = [
+            {"source_id": r[0], "branch": r[1], "slips_count": len(json.loads(r[2]))}
+            for r in cursor.fetchall()
+        ]
+    return {
+        "active_sessions": sessions,
+        "recent_logs": recent_logs,
+    }
+
+
 @app.post("/callback")
 async def callback(request: Request, x_line_signature: str = Header(None)):
     """รับ Webhook event จาก LINE Platform"""
@@ -212,9 +244,12 @@ async def callback(request: Request, x_line_signature: str = Header(None)):
         raise HTTPException(status_code=400, detail="Missing X-Line-Signature")
 
     body = await request.body()
+    body_str = body.decode("utf-8")
+    log_event("WEBHOOK_IN", f"ได้รับ Request ขนาด {len(body_str)} ตัวอักษร")
     try:
-        handler.handle(body.decode("utf-8"), x_line_signature)
+        handler.handle(body_str, x_line_signature)
     except InvalidSignatureError:
+        log_event("SIGNATURE_ERR", "Invalid Signature")
         raise HTTPException(status_code=400, detail="Invalid signature")
 
     return "OK"
@@ -228,14 +263,16 @@ def handle_text_message(event):
     text = event.message.text.strip()
     source_id = get_source_id(event)
     reply_token = event.reply_token
+    log_event("TEXT_RECEIVED", f"ข้อความ: '{text}' จาก {source_id}")
 
-    # 1. ตรวจจับคำสั่ง #รวม หรือ #รวม <ชื่อสาขา>
-    # รองรับทั้ง #รวมอุดร หรือ #รวม อุดร
-    match_sum = re.match(r"^#รวม(?:\s*(.+))?$", text, re.IGNORECASE)
+    # 1. ตรวจจับคำสั่ง #รวม หรือ # รวม หรือ รวม <ชื่อสาขา>
+    # รองรับ: #รวม ขอนแก่น, # รวม ขอนแก่น, #รวมขอนแก่น, รวม ขอนแก่น
+    match_sum = re.match(r"^(?:#\s*)?รวม(?:\s+(.+))?$", text, re.IGNORECASE)
     if match_sum:
         branch = match_sum.group(1).strip() if match_sum.group(1) else ""
         # เริ่มนับใหม่ทันที (ถ้ามี session เก่าค้างอยู่จะถูกล้างทิ้ง)
         start_session(source_id, branch)
+        log_event("SESSION_START", f"เริ่มนับสลิปสาขา: '{branch or 'ทั่วไป'}'")
 
         if branch:
             reply_text = f"พร้อมรับรูปสาขา {branch}"
@@ -245,8 +282,9 @@ def handle_text_message(event):
         reply_line_message(reply_token, reply_text)
         return
 
-    # 2. ตรวจจับคำสั่งจบการนับ #ok หรือ #OK หรือ #จบ
-    if text.lower() in ["#ok", "#จบ"]:
+    # 2. ตรวจจับคำสั่งจบการนับ: #ok, # ok, ok, #จบ, จบ
+    cleaned_lower = re.sub(r"^[#\s]+", "", text.lower()).strip()
+    if cleaned_lower in ["ok", "จบ"]:
         session = get_session(source_id)
         if not session:
             reply_line_message(
@@ -286,6 +324,7 @@ def handle_text_message(event):
 
         # เคลียร์ session จบการทำงาน
         clear_session(source_id)
+        log_event("SESSION_FINISH", f"สรุปยอดสาขา: '{branch}' {len(slips)} ใบ ยอด {total_amount} บาท")
 
         reply_line_message(reply_token, summary_msg)
         return
@@ -299,6 +338,7 @@ def handle_image_message(event):
     """อ่านรูป + แยกหมวดหมู่ + ถ้ามี session สะสมยอด ให้เก็บยอดไว้ตอบตอน #ok"""
     message_id = event.message.id
     source_id = get_source_id(event)
+    log_event("IMAGE_IN", f"ได้รับรูปภาพ id: {message_id} จาก {source_id}")
 
     # ตรวจสอบว่าห้องแชทนี้กำลังเปิด session สะสมยอดสลิปอยู่หรือไม่
     current_session = get_session(source_id)
