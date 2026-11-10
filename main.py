@@ -1,9 +1,12 @@
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 import json
 import os
 import re
 import sqlite3
 import sys
-from datetime import datetime
+import threading
+import time
 
 # บังคับใช้ UTF-8 encoding บน Windows เพื่อไม่ให้ติดปัญหา cp1252 กับภาษาไทย
 if hasattr(sys.stdout, "reconfigure"):
@@ -45,7 +48,42 @@ configuration = Configuration(access_token=CHANNEL_ACCESS_TOKEN or "")
 handler = WebhookHandler(CHANNEL_SECRET or "")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY or "")
 
-app = FastAPI(title="LINE Bot OCR to Google Sheets with Batching")
+app = FastAPI(title="LINE Bot OCR to Google Sheets with Fast Batching")
+
+# ==========================================
+# ระบบจัดการคิวประมวลผลรูปภาพแบบคู่ขนาน (Parallel Worker Pool)
+# ==========================================
+# รองรับการประมวลผลรูปภาพพร้อมกัน 8 ภาพ เพื่อความเร็วสูงสุด
+image_executor = ThreadPoolExecutor(max_workers=8)
+
+pending_tasks = {}
+pending_lock = threading.Lock()
+
+
+def add_pending(source_id: str):
+    with pending_lock:
+        pending_tasks[source_id] = pending_tasks.get(source_id, 0) + 1
+
+
+def remove_pending(source_id: str):
+    with pending_lock:
+        if source_id in pending_tasks:
+            pending_tasks[source_id] -= 1
+            if pending_tasks[source_id] <= 0:
+                del pending_tasks[source_id]
+
+
+def wait_for_pending(source_id: str, timeout: float = 12.0) -> bool:
+    """รอให้รูปภาพทั้งหมดที่กำลังประมวลผลอยู่เสร็จสิ้น ก่อนจะเริ่มรวมยอด"""
+    start = time.time()
+    while time.time() - start < timeout:
+        with pending_lock:
+            count = pending_tasks.get(source_id, 0)
+        if count == 0:
+            return True
+        time.sleep(0.2)
+    return False
+
 
 # บันทึกประวัติ Event ล่าสุด 50 รายการ สำหรับตรวจสอบผ่าน /debug
 recent_logs = []
@@ -62,14 +100,16 @@ def log_event(action: str, detail: str):
     except Exception:
         pass
 
+
 # ==========================================
-# ระบบจัดการ Session สะสมยอดสลิป (SQLite)
+# ระบบจัดการ Session สะสมยอดสลิป (SQLite WAL Mode)
 # ==========================================
 DB_PATH = "sessions.db"
 
 
 def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS slip_sessions (
@@ -102,7 +142,7 @@ def get_source_id(event) -> str:
 def start_session(source_id: str, branch: str = ""):
     """เริ่ม Session ใหม่ (หากมีของเดิมอยู่แล้ว ให้รีเซ็ตเริ่มนับใหม่ทันที)"""
     today_str = datetime.now().strftime("%d/%m/%Y")
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         conn.execute(
             """
             INSERT INTO slip_sessions (source_id, branch, created_date, slips_json, updated_at)
@@ -120,7 +160,7 @@ def start_session(source_id: str, branch: str = ""):
 
 def get_session(source_id: str):
     """ดึงข้อมูล Session ที่กำลังเปิดใช้งานอยู่"""
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         cursor = conn.cursor()
         cursor.execute(
             "SELECT branch, created_date, slips_json FROM slip_sessions WHERE source_id = ?",
@@ -142,15 +182,24 @@ def get_session(source_id: str):
 
 
 def add_slip_to_session(source_id: str, amount: float, ref_no: str = ""):
-    """เพิ่มข้อมูลสลิปเข้าไปใน Session สะสม"""
-    session = get_session(source_id)
-    if not session:
-        return False
+    """เพิ่มข้อมูลสลิปเข้าไปใน Session สะสม (Thread-safe)"""
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT slips_json FROM slip_sessions WHERE source_id = ?",
+            (source_id,),
+        )
+        row = cursor.fetchone()
+        if not row:
+            return False
 
-    slips = session["slips"]
-    slips.append({"amount": amount, "ref_no": ref_no})
+        try:
+            slips = json.loads(row[0])
+        except Exception:
+            slips = []
 
-    with sqlite3.connect(DB_PATH) as conn:
+        slips.append({"amount": amount, "ref_no": ref_no})
+
         conn.execute(
             "UPDATE slip_sessions SET slips_json = ?, updated_at = CURRENT_TIMESTAMP WHERE source_id = ?",
             (json.dumps(slips, ensure_ascii=False), source_id),
@@ -161,7 +210,7 @@ def add_slip_to_session(source_id: str, amount: float, ref_no: str = ""):
 
 def clear_session(source_id: str):
     """ลบ Session ออกเมื่อสรุปยอดเสร็จสิ้น (#ok)"""
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         conn.execute("DELETE FROM slip_sessions WHERE source_id = ?", (source_id,))
         conn.commit()
 
@@ -200,23 +249,22 @@ def send_to_google_sheet(data: dict):
     """ส่งข้อมูล JSON ไปบันทึกลง Google Sheets ผ่าน Apps Script Web App"""
     webhook_url = os.getenv("GOOGLE_SHEET_WEBAPP_URL")
     if not webhook_url:
-        print("[Sheet] ยังไม่ได้กำหนด GOOGLE_SHEET_WEBAPP_URL ใน .env")
         return False
 
     try:
         with httpx.Client(follow_redirects=True, timeout=15.0) as client:
             resp = client.post(webhook_url, json=data)
-            print(f"[Sheet] บันทึกข้อมูลสำเร็จ ({data.get('category')}): {resp.status_code}")
+            log_event("SHEET_OK", f"บันทึกชีทสำเร็จ ({data.get('category')}): {resp.status_code}")
             return True
     except Exception as e:
-        print(f"[Sheet Error] ไม่สามารถส่งข้อมูลไป Google Sheet: {e}")
+        log_event("SHEET_ERR", f"บันทึกชีทไม่สำเร็จ: {e}")
         return False
 
 
 @app.get("/")
 def read_root():
     return {
-        "status": "LINE Bot OCR to Google Sheets with Batching is running!",
+        "status": "LINE Bot OCR to Google Sheets with Fast Batching is running!",
         "sheet_configured": bool(GOOGLE_SHEET_WEBAPP_URL),
     }
 
@@ -224,7 +272,7 @@ def read_root():
 @app.get("/debug")
 def read_debug():
     """ดู Log เหตุการณ์ล่าสุดที่ยิงเข้ามายัง Webhook"""
-    with sqlite3.connect(DB_PATH) as conn:
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         cursor = conn.cursor()
         cursor.execute("SELECT source_id, branch, slips_json FROM slip_sessions")
         sessions = [
@@ -266,11 +314,9 @@ def handle_text_message(event):
     log_event("TEXT_RECEIVED", f"ข้อความ: '{text}' จาก {source_id}")
 
     # 1. ตรวจจับคำสั่ง #รวม หรือ # รวม หรือ รวม <ชื่อสาขา>
-    # รองรับ: #รวม ขอนแก่น, # รวม ขอนแก่น, #รวมขอนแก่น, รวม ขอนแก่น
     match_sum = re.match(r"^(?:#\s*)?รวม(?:\s+(.+))?$", text, re.IGNORECASE)
     if match_sum:
         branch = match_sum.group(1).strip() if match_sum.group(1) else ""
-        # เริ่มนับใหม่ทันที (ถ้ามี session เก่าค้างอยู่จะถูกล้างทิ้ง)
         start_session(source_id, branch)
         log_event("SESSION_START", f"เริ่มนับสลิปสาขา: '{branch or 'ทั่วไป'}'")
 
@@ -293,6 +339,11 @@ def handle_text_message(event):
             )
             return
 
+        # หากยังมีรูปภาพที่กำลังประมวลผลค้างอยู่ใน ThreadPool ให้รอให้เสร็จก่อน (สูงสุด 12 วิ)
+        wait_for_pending(source_id, timeout=12.0)
+
+        # ดึงข้อมูลรอบล่าสุดหลังรูปประมวลผลเสร็จทั้งหมด
+        session = get_session(source_id) or session
         slips = session.get("slips", [])
         branch = session.get("branch", "")
         session_date = session.get("date", datetime.now().strftime("%d/%m/%Y"))
@@ -322,161 +373,125 @@ def handle_text_message(event):
             f"บันทึกลง Google Sheets เรียบร้อยแล้วครับ"
         )
 
-        # เคลียร์ session จบการทำงาน
         clear_session(source_id)
-        log_event("SESSION_FINISH", f"สรุปยอดสาขา: '{branch}' {len(slips)} ใบ ยอด {total_amount} บาท")
+        log_event("SESSION_FINISH", f"สรุปยอดสาขา: '{branch}' {len(slips)} ใบ ยอด {total_amount:,.2f} บาท")
 
         reply_line_message(reply_token, summary_msg)
         return
 
 
 # ==========================================
-# จัดการรูปภาพที่ส่งเข้ามา
+# ฟังก์ชันประมวลผลรูปภาพแบบคู่ขนาน (Worker Task)
 # ==========================================
-@handler.add(MessageEvent, message=ImageMessageContent)
-def handle_image_message(event):
-    """อ่านรูป + แยกหมวดหมู่ + ถ้ามี session สะสมยอด ให้เก็บยอดไว้ตอบตอน #ok"""
-    message_id = event.message.id
-    source_id = get_source_id(event)
-    log_event("IMAGE_IN", f"ได้รับรูปภาพ id: {message_id} จาก {source_id}")
-
-    # ตรวจสอบว่าห้องแชทนี้กำลังเปิด session สะสมยอดสลิปอยู่หรือไม่
-    current_session = get_session(source_id)
-    branch_name = current_session.get("branch", "") if current_session else ""
-
-    with ApiClient(configuration) as api_client:
-        messaging_api_blob = MessagingApiBlob(api_client)
-
-        try:
-            # 1. ดึงไฟล์รูปภาพจาก LINE Content API
-            image_bytes = messaging_api_blob.get_message_content(message_id)
-
-            # 2. ส่งรูปให้ Gemini วิเคราะห์และจำแนก 4 หมวดหมู่
-            prompt = """คุณคือ AI ผู้ช่วยวิเคราะห์รูปภาพและแยกหมวดหมู่สำหรับบันทึกลง Google Sheet
-วิเคราะห์ภาพนี้และจัดให้อยู่ใน 1 ใน 4 หมวดหมู่นี้เท่านั้น:
-1. "สลิปโอนเงิน" (สลิปธนาคาร, หลักฐานการโอนเงิน)
-2. "ลงเวลาทำงาน" (หน้าจอแอพตอกบัตร, ลงเวลาเข้า-ออกงาน, สแกนนิ้ว, ป้ายเวลา)
-3. "ส่งรายงาน" (รายงานการปฏิบัติงาน, เอกสารสรุปงาน, ภาพถ่ายงานพร้อมบันทึกข้อความ)
-4. "อื่นๆ" (ภาพที่ไม่เข้าข่าย 3 หมวดหมู่ข้างต้น เช่น รูปถ่ายทั่วไป, รูปวิว, รูปที่ไม่เกี่ยวข้อง, หรือภาพที่ไม่มีข้อความ)
-
-โปรดตอบเป็น JSON เท่านั้น (ไม่ต้องใส่ markdown code fence อื่นใด) โดยมีโครงสร้างดังนี้:
-
-ถ้าเป็น "สลิปโอนเงิน":
+PROMPT_FAST_SLIP = """คุณคือ AI อ่านสลิปโอนเงิน โปรดดึงข้อมูลในรูปแบบ JSON เท่านั้น (ห้ามใส่คำบรรยายอื่น):
 {
   "category": "สลิปโอนเงิน",
-  "amount": "ยอดเงิน (เฉพาะตัวเลข เช่น 500.00)",
-  "bank": "ธนาคารหรือผู้ให้บริการ",
-  "sender": "ชื่อผู้โอน/บัญชีผู้โอน",
-  "receiver": "ชื่อผู้รับ/บัญชีผู้รับ",
+  "amount": "ยอดเงินเฉพาะตัวเลข เช่น 500.00",
+  "bank": "ชื่อธนาคาร",
+  "sender": "ชื่อผู้โอน",
+  "receiver": "ชื่อผู้รับ",
   "trans_date": "วันที่ทำรายการ",
   "trans_time": "เวลาทำรายการ",
   "ref_no": "เลขที่อ้างอิง/รหัสรายการ",
   "branch": "ชื่อสาขาหรือสถานที่ (หากมีระบุในสลิป)",
-  "raw_text": "ข้อความสำคัญทั้งหมดที่อ่านได้"
-}
+  "raw_text": "ข้อความสำคัญย่อๆ"
+}"""
 
-ถ้าเป็น "ลงเวลาทำงาน":
+PROMPT_GENERAL = """คุณคือ AI วิเคราะห์รูปภาพและแยกหมวดหมู่สำหรับบันทึกลง Google Sheet
+วิเคราะห์ภาพนี้และจัดให้อยู่ใน 1 ใน 4 หมวดหมู่นี้:
+1. "สลิปโอนเงิน", 2. "ลงเวลาทำงาน", 3. "ส่งรายงาน", 4. "อื่นๆ"
+ตอบเป็น JSON เท่านั้น:
 {
-  "category": "ลงเวลาทำงาน",
-  "employee_name": "ชื่อพนักงาน",
+  "category": "หมวดหมู่",
+  "amount": "ยอดเงิน (กรณีสลิป)",
+  "bank": "ธนาคาร",
+  "sender": "ผู้โอน",
+  "receiver": "ผู้รับ",
+  "trans_date": "วันที่",
+  "trans_time": "เวลา",
+  "ref_no": "เลขอ้างอิง",
+  "employee_name": "ชื่อพนักงาน (กรณีลงเวลา)",
   "work_date": "วันที่",
   "work_time": "เวลา",
-  "work_type": "ประเภท (เช่น เข้างาน, ออกงาน, OT)",
-  "location": "สถานที่หรือสาขา (ถ้ามี)",
-  "raw_text": "ข้อความสำคัญทั้งหมดที่อ่านได้"
-}
+  "work_type": "ประเภท",
+  "location": "สถานที่/สาขา",
+  "reporter_name": "ชื่อผู้รายงาน",
+  "report_title": "หัวข้อ",
+  "summary": "สรุปงาน",
+  "branch": "ชื่อสาขา",
+  "description": "คำอธิบายภาพ",
+  "raw_text": "ข้อความในภาพ"
+}"""
 
-ถ้าเป็น "ส่งรายงาน":
-{
-  "category": "ส่งรายงาน",
-  "reporter_name": "ชื่อผู้ส่งรายงาน/พนักงาน",
-  "report_title": "หัวข้อรายงาน",
-  "summary": "สรุปเนื้อหาของรายงาน",
-  "report_date": "วันที่",
-  "raw_text": "ข้อความสำคัญทั้งหมดที่อ่านได้"
-}
 
-ถ้าเป็น "อื่นๆ":
-{
-  "category": "อื่นๆ",
-  "description": "คำอธิบายภาพสั้นๆ ว่าเป็นภาพอะไร",
-  "raw_text": "ข้อความที่พบในภาพ (หากไม่มีข้อความให้ใส่ 'ไม่มีข้อความ')"
-}
-"""
+def process_image_worker(image_bytes: bytes, source_id: str, branch_name: str, is_in_session: bool):
+    """ฟังก์ชันที่ทำงานใน Background Thread เพื่อประมวลผลรูปภาพพร้อมๆ กันหลายใบ"""
+    try:
+        # หากอยู่ใน session รวมยอดสลิป ให้ใช้ prompt สลิปแบบเร็วพิเศษ
+        prompt = PROMPT_FAST_SLIP if is_in_session else PROMPT_GENERAL
 
-            candidate_models = [
-                "gemini-3.5-flash-lite",
-                "gemini-3.1-flash-lite",
-                "gemini-3.8-flash",
-            ]
+        candidate_models = [
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-3.8-flash",
+        ]
 
-            response_text = ""
-            for model_name in candidate_models:
-                try:
-                    response = gemini_client.models.generate_content(
-                        model=model_name,
-                        contents=[
-                            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                            prompt,
-                        ],
-                    )
-                    if response and response.text:
-                        response_text = response.text.strip()
-                        break
-                except Exception as err:
-                    print(f"Model {model_name} failed: {err}")
-                    continue
+        response_text = ""
+        for model_name in candidate_models:
+            try:
+                response = gemini_client.models.generate_content(
+                    model=model_name,
+                    contents=[
+                        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                        prompt,
+                    ],
+                )
+                if response and response.text:
+                    response_text = response.text.strip()
+                    break
+            except Exception as err:
+                continue
 
-            # ถอดรหัส JSON จากคำตอบของ Gemini
-            parsed_data = None
-            if response_text:
-                clean_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", response_text, flags=re.MULTILINE).strip()
-                try:
-                    parsed_data = json.loads(clean_json)
-                except Exception:
-                    parsed_data = {
-                        "category": "อื่นๆ",
-                        "description": "ข้อความจากการอ่านภาพ",
-                        "raw_text": response_text,
-                    }
-
-            if not parsed_data:
+        parsed_data = None
+        if response_text:
+            clean_json = re.sub(r"^```(?:json)?\s*|\s*```$", "", response_text, flags=re.MULTILINE).strip()
+            try:
+                parsed_data = json.loads(clean_json)
+            except Exception:
                 parsed_data = {
-                    "category": "อื่นๆ",
-                    "description": "ไม่พบข้อมูลในรูปภาพ",
-                    "raw_text": "ไม่มีข้อความ",
+                    "category": "สลิปโอนเงิน" if is_in_session else "อื่นๆ",
+                    "description": "ข้อความจากการอ่านภาพ",
+                    "raw_text": response_text,
                 }
 
-            # แนบชื่อสาขา: ถ้ามีสาขาจากคำสั่ง #รวม ให้ใช้ก่อน ถ้าไม่มีให้ใช้ที่ AI ตรวจพบจากสลิป
-            detected_branch = parsed_data.get("branch", "") if isinstance(parsed_data, dict) else ""
-            final_branch = branch_name if branch_name else detected_branch
-            parsed_data["branch"] = final_branch or "-"
+        if not parsed_data:
+            parsed_data = {
+                "category": "อื่นๆ",
+                "description": "ไม่พบข้อมูลในรูปภาพ",
+                "raw_text": "ไม่มีข้อความ",
+            }
 
-            # 3. ถ้าเป็นสลิปโอนเงิน และกำลังอยู่ใน session #รวม ให้นับยอดเงินสะสมไว้
-            if parsed_data.get("category") == "สลิปโอนเงิน" and current_session:
-                amt = clean_amount(parsed_data.get("amount"))
-                ref = parsed_data.get("ref_no", "")
-                add_slip_to_session(source_id, amt, ref)
+        # กำหนดชื่อสาขา
+        detected_branch = parsed_data.get("branch", "") if isinstance(parsed_data, dict) else ""
+        final_branch = branch_name if branch_name else detected_branch
+        parsed_data["branch"] = final_branch or "-"
 
-            # 4. ส่งข้อมูลไปบันทึกลง Google Sheets
-            send_to_google_sheet(parsed_data)
+        # หากเป็นสลิป และอยู่ใน session ให้สะสมยอดเงิน
+        if parsed_data.get("category") == "สลิปโอนเงิน" and is_in_session:
+            amt = clean_amount(parsed_data.get("amount"))
+            ref = parsed_data.get("ref_no", "")
+            add_slip_to_session(source_id, amt, ref)
+            log_event("SLIP_ADDED", f"บันทึกยอดสลิป: {amt:,.2f} บาท ({final_branch})")
 
-            try:
-                print(f"[Processed] แยกหมวดหมู่ได้: {parsed_data.get('category')} (สาขา: {branch_name or '-'})")
-            except Exception:
-                pass
+        # ส่งข้อมูลบันทึกลง Google Sheets
+        send_to_google_sheet(parsed_data)
 
-        except Exception as e:
-            try:
-                print(f"[Error] เกิดข้อผิดพลาดในการประมวลผลรูปภาพ: {e}")
-            except Exception:
-                pass
-
-        # ระหว่างส่งรูป ไม่ตอบกลับข้อความใดๆ ให้ส่งรูปได้ต่อเนื่อง
+    except Exception as e:
+        log_event("IMAGE_ERR", f"เกิดข้อผิดพลาดในการประมวลผลรูป: {e}")
+    finally:
+        remove_pending(source_id)
 
 
-if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+# ==========================================
+# จัดการรูปภาพที่ส่งเข้ามา (รับทันที แล้วโยนให้ Worker Pool)
+# ==
