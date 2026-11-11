@@ -181,7 +181,7 @@ def get_session(source_id: str):
     return None
 
 
-def add_slip_to_session(source_id: str, amount: float, ref_no: str = ""):
+def add_slip_to_session(source_id: str, amount: float, receiver: str = "", trans_date: str = "", trans_time: str = ""):
     """เพิ่มข้อมูลสลิปเข้าไปใน Session สะสม (Thread-safe)"""
     with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         cursor = conn.cursor()
@@ -198,7 +198,12 @@ def add_slip_to_session(source_id: str, amount: float, ref_no: str = ""):
         except Exception:
             slips = []
 
-        slips.append({"amount": amount, "ref_no": ref_no})
+        slips.append({
+            "amount": amount,
+            "receiver": receiver,
+            "trans_date": trans_date,
+            "trans_time": trans_time,
+        })
 
         conn.execute(
             "UPDATE slip_sessions SET slips_json = ?, updated_at = CURRENT_TIMESTAMP WHERE source_id = ?",
@@ -353,7 +358,15 @@ def handle_text_message(event):
         for i, s in enumerate(slips, 1):
             amt = float(s.get("amount", 0.0))
             total_amount += amt
-            slip_lines.append(f"{i}. {amt:,.2f} บาท")
+            rcv = str(s.get("receiver", "") or "").strip()
+            tm = str(s.get("trans_time", "") or "").strip()
+            extra = []
+            if rcv and rcv != "-":
+                extra.append(f"โอนไป: {rcv}")
+            if tm and tm != "-":
+                extra.append(f"เวลา {tm}")
+            extra_str = f" ({', '.join(extra)})" if extra else ""
+            slip_lines.append(f"{i}. {amt:,.2f} บาท{extra_str}")
 
         branch_header = f"สาขา: {branch}\n" if branch else ""
         if slip_lines:
@@ -383,44 +396,37 @@ def handle_text_message(event):
 # ==========================================
 # ฟังก์ชันประมวลผลรูปภาพแบบคู่ขนาน (Worker Task)
 # ==========================================
-PROMPT_FAST_SLIP = """คุณคือ AI อ่านสลิปโอนเงิน โปรดดึงข้อมูลในรูปแบบ JSON เท่านั้น (ห้ามใส่คำบรรยายอื่น):
+# เน้นความเร็วสูงสุด: ดึงเฉพาะ 4 ข้อมูลสำคัญ (ยอดเงิน, ผู้รับ, วันที่, เวลา)
+PROMPT_FAST_SLIP = """คุณคือ AI อ่านสลิปโอนเงินความเร็วสูง โปรดอ่านเฉพาะ 4 ข้อมูลสำคัญนี้เท่านั้น ตอบเป็น JSON (ห้ามใส่คำบรรยายอื่น):
 {
   "category": "สลิปโอนเงิน",
   "amount": "ยอดเงินเฉพาะตัวเลข เช่น 500.00",
-  "bank": "ชื่อธนาคาร",
-  "sender": "ชื่อผู้โอน",
-  "receiver": "ชื่อผู้รับ",
-  "trans_date": "วันที่ทำรายการ",
-  "trans_time": "เวลาทำรายการ",
-  "ref_no": "เลขที่อ้างอิง/รหัสรายการ",
-  "branch": "ชื่อสาขาหรือสถานที่ (หากมีระบุในสลิป)",
-  "raw_text": "ข้อความสำคัญย่อๆ"
+  "receiver": "โอนไปที่ไหนหรือชื่อบัญชีผู้รับเงิน",
+  "trans_date": "วันที่ทำรายการ เช่น 11/11/2026",
+  "trans_time": "เวลาทำรายการ เช่น 09:18",
+  "branch": "ชื่อสาขา (หากมีระบุในสลิป)"
 }"""
 
 PROMPT_GENERAL = """คุณคือ AI วิเคราะห์รูปภาพและแยกหมวดหมู่สำหรับบันทึกลง Google Sheet
 วิเคราะห์ภาพนี้และจัดให้อยู่ใน 1 ใน 4 หมวดหมู่นี้:
 1. "สลิปโอนเงิน", 2. "ลงเวลาทำงาน", 3. "ส่งรายงาน", 4. "อื่นๆ"
-ตอบเป็น JSON เท่านั้น:
+ตอบเป็น JSON สั้นๆ เท่านั้น:
 {
-  "category": "หมวดหมู่",
+  "category": "หมวดหมู่ (สลิปโอนเงิน | ลงเวลาทำงาน | ส่งรายงาน | อื่นๆ)",
   "amount": "ยอดเงิน (กรณีสลิป)",
-  "bank": "ธนาคาร",
-  "sender": "ผู้โอน",
-  "receiver": "ผู้รับ",
-  "trans_date": "วันที่",
-  "trans_time": "เวลา",
-  "ref_no": "เลขอ้างอิง",
+  "receiver": "ผู้รับเงิน / โอนไปที่ไหน (กรณีสลิป)",
+  "trans_date": "วันที่ (กรณีสลิป)",
+  "trans_time": "เวลา (กรณีสลิป)",
   "employee_name": "ชื่อพนักงาน (กรณีลงเวลา)",
-  "work_date": "วันที่",
-  "work_time": "เวลา",
+  "work_date": "วันที่เข้างาน",
+  "work_time": "เวลาเข้างาน",
   "work_type": "ประเภท",
   "location": "สถานที่/สาขา",
-  "reporter_name": "ชื่อผู้รายงาน",
-  "report_title": "หัวข้อ",
-  "summary": "สรุปงาน",
+  "reporter_name": "ชื่อผู้รายงาน (กรณีส่งรายงาน)",
+  "report_title": "หัวข้อรายงาน",
+  "summary": "สรุปรายงาน",
   "branch": "ชื่อสาขา",
-  "description": "คำอธิบายภาพ",
-  "raw_text": "ข้อความในภาพ"
+  "description": "คำอธิบายภาพ"
 }"""
 
 
@@ -445,6 +451,10 @@ def process_image_worker(image_bytes: bytes, source_id: str, branch_name: str, i
                         types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
                         prompt,
                     ],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        temperature=0.1,
+                    ),
                 )
                 if response and response.text:
                     response_text = response.text.strip()
@@ -476,48 +486,24 @@ def process_image_worker(image_bytes: bytes, source_id: str, branch_name: str, i
         final_branch = branch_name if branch_name else detected_branch
         parsed_data["branch"] = final_branch or "-"
 
+        # สำหรับ Google Sheets สลิปโอนเงิน เติมค่าคอลัมน์เพื่อให้ตารางตรงกันครบถ้วน
+        if parsed_data.get("category") == "สลิปโอนเงิน":
+            parsed_data.setdefault("bank", "-")
+            parsed_data.setdefault("sender", "-")
+            parsed_data.setdefault("ref_no", "-")
+            parsed_data.setdefault("raw_text", "-")
+
         # หากเป็นสลิป และอยู่ใน session ให้สะสมยอดเงิน
         if parsed_data.get("category") == "สลิปโอนเงิน" and is_in_session:
             amt = clean_amount(parsed_data.get("amount"))
-            ref = parsed_data.get("ref_no", "")
-            add_slip_to_session(source_id, amt, ref)
-            log_event("SLIP_ADDED", f"บันทึกยอดสลิป: {amt:,.2f} บาท ({final_branch})")
+            rcv = str(parsed_data.get("receiver", "") or "").strip()
+            t_date = str(parsed_data.get("trans_date", "") or "").strip()
+            t_time = str(parsed_data.get("trans_time", "") or "").strip()
+            add_slip_to_session(source_id, amt, receiver=rcv, trans_date=t_date, trans_time=t_time)
+            log_event("SLIP_ADDED", f"บันทึกยอดสลิป: {amt:,.2f} บาท ({final_branch}) โอนไป: {rcv}")
 
         # ส่งข้อมูลบันทึกลง Google Sheets
         send_to_google_sheet(parsed_data)
 
     except Exception as e:
-        log_event("IMAGE_ERR", f"เกิดข้อผิดพลาดในการประมวลผลรูป: {e}")
-    finally:
-        remove_pending(source_id)
-
-
-# ==========================================
-# จัดการรูปภาพที่ส่งเข้ามา (รับทันที แล้วโยนให้ Worker Pool)
-# ==========================================
-@handler.add(MessageEvent, message=ImageMessageContent)
-def handle_image_message(event):
-    message_id = event.message.id
-    source_id = get_source_id(event)
-    log_event("IMAGE_IN", f"ได้รับรูปภาพ id: {message_id} จาก {source_id}")
-
-    current_session = get_session(source_id)
-    branch_name = current_session.get("branch", "") if current_session else ""
-    is_in_session = bool(current_session)
-
-    with ApiClient(configuration) as api_client:
-        messaging_api_blob = MessagingApiBlob(api_client)
-        try:
-            image_bytes = messaging_api_blob.get_message_content(message_id)
-            # นับจำนวนรูปที่กำลังทำงาน และส่งให้ Worker ทำงานพร้อมๆ กันแบบคู่ขนาน (Non-blocking)
-            add_pending(source_id)
-            image_executor.submit(process_image_worker, image_bytes, source_id, branch_name, is_in_session)
-        except Exception as e:
-            log_event("DOWNLOAD_ERR", f"ดาวน์โหลดรูปภาพไม่สำเร็จ: {e}")
-
-
-if __name__ == "__main__":
-    import uvicorn
-
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+        log_event("I
