@@ -494,4 +494,30 @@ def process_image_worker(image_bytes: bytes, source_id: str, branch_name: str, i
 
 # ==========================================
 # จัดการรูปภาพที่ส่งเข้ามา (รับทันที แล้วโยนให้ Worker Pool)
-# ==
+# ==========================================
+@handler.add(MessageEvent, message=ImageMessageContent)
+def handle_image_message(event):
+    message_id = event.message.id
+    source_id = get_source_id(event)
+    log_event("IMAGE_IN", f"ได้รับรูปภาพ id: {message_id} จาก {source_id}")
+
+    current_session = get_session(source_id)
+    branch_name = current_session.get("branch", "") if current_session else ""
+    is_in_session = bool(current_session)
+
+    with ApiClient(configuration) as api_client:
+        messaging_api_blob = MessagingApiBlob(api_client)
+        try:
+            image_bytes = messaging_api_blob.get_message_content(message_id)
+            # นับจำนวนรูปที่กำลังทำงาน และส่งให้ Worker ทำงานพร้อมๆ กันแบบคู่ขนาน (Non-blocking)
+            add_pending(source_id)
+            image_executor.submit(process_image_worker, image_bytes, source_id, branch_name, is_in_session)
+        except Exception as e:
+            log_event("DOWNLOAD_ERR", f"ดาวน์โหลดรูปภาพไม่สำเร็จ: {e}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
