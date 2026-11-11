@@ -121,6 +121,21 @@ def init_db():
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS recent_slips (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id TEXT,
+                amount REAL,
+                receiver TEXT,
+                trans_date TEXT,
+                trans_time TEXT,
+                branch TEXT,
+                summarized INTEGER DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
         conn.commit()
 
 
@@ -218,6 +233,112 @@ def clear_session(source_id: str):
     with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
         conn.execute("DELETE FROM slip_sessions WHERE source_id = ?", (source_id,))
         conn.commit()
+
+
+def record_recent_slip(source_id: str, amount: float, receiver: str = "", trans_date: str = "", trans_time: str = "", branch: str = ""):
+    """บันทึกประวัติสลิปเพื่อรองรับกรณีที่ผู้ใช้ลืมพิมพ์ #รวม ก่อนส่งรูป"""
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        conn.execute(
+            """
+            INSERT INTO recent_slips (source_id, amount, receiver, trans_date, trans_time, branch)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (source_id, amount, receiver, trans_date, trans_time, branch),
+        )
+        conn.commit()
+
+
+def get_unsummarized_recent_slips(source_id: str, minutes: int = 25):
+    """ดึงสลิปที่เพิ่งส่งเข้ามาใน 25 นาทีล่าสุดที่ยังไม่ได้สรุปยอด"""
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, amount, receiver, trans_date, trans_time, branch
+            FROM recent_slips
+            WHERE source_id = ? AND summarized = 0
+              AND created_at >= datetime('now', ?)
+            ORDER BY id ASC
+            """,
+            (source_id, f"-{minutes} minutes"),
+        )
+        rows = cursor.fetchall()
+        return [
+            {
+                "id": r[0],
+                "amount": r[1],
+                "receiver": r[2],
+                "trans_date": r[3],
+                "trans_time": r[4],
+                "branch": r[5],
+            }
+            for r in rows
+        ]
+
+
+def mark_slips_summarized(source_id: str, slip_ids: list):
+    """ทำเครื่องหมายว่าสรุปยอดสลิปเหล่านี้ไปแล้ว"""
+    if not slip_ids:
+        return
+    with sqlite3.connect(DB_PATH, timeout=30.0) as conn:
+        placeholders = ",".join(["?"] * len(slip_ids))
+        conn.execute(
+            f"UPDATE recent_slips SET summarized = 1 WHERE id IN ({placeholders})",
+            slip_ids,
+        )
+        conn.commit()
+
+
+def get_recent_slips_from_sheet(max_minutes: int = 45):
+    """ดึงข้อมูลสลิปที่เพิ่งบันทึกลงใน Google Sheet โดยตรง (Safety Net กรณี Server Restart)"""
+    try:
+        sheet_url = "https://docs.google.com/spreadsheets/d/1Y77iPthAeqPVGBi6qY9JrdHgfPEEeFTHJvz0DjxRYrA/gviz/tq?tqx=out:csv&sheet=สลิปโอนเงิน"
+        resp = httpx.get(sheet_url, timeout=6.0)
+        if resp.status_code != 200:
+            return []
+        import csv
+        import io
+        rows = list(csv.reader(io.StringIO(resp.text)))[1:]
+        slips = []
+        now = datetime.now()
+        for r in rows:
+            if len(r) < 10:
+                continue
+            created_str = r[0].strip()
+            # ตรวจสอบเวลาที่บันทึก
+            try:
+                created_dt = datetime.strptime(created_str, "%Y-%m-%d %H:%M:%S")
+                if (now - created_dt).total_seconds() > (max_minutes * 60):
+                    continue
+            except Exception:
+                pass
+
+            amt = 0.0
+            if r[1]:
+                try:
+                    amt = float(r[1].replace(",", ""))
+                except Exception:
+                    pass
+            # หากยอดเงินว่าง ให้ดึงจากข้อความรวมในภาพ (คอลัมน์ I)
+            if amt == 0.0 and len(r) > 8:
+                m = re.search(r"จำนวน:\s*([0-9,.]+)\s*บาท", r[8])
+                if m:
+                    try:
+                        amt = float(m.group(1).replace(",", ""))
+                    except Exception:
+                        pass
+
+            slips.append({
+                "amount": amt,
+                "receiver": r[4].strip(),
+                "trans_date": r[5].strip(),
+                "trans_time": r[6].strip(),
+                "branch": r[9].strip() if r[9].strip() != "-" else "",
+            })
+        return slips
+    except Exception as e:
+        log_event("SHEET_FETCH_ERR", f"ดึงสลิปจากชีทไม่สำเร็จ: {e}")
+        return []
 
 
 def clean_amount(val) -> float:
@@ -336,22 +457,41 @@ def handle_text_message(event):
     # 2. ตรวจจับคำสั่งจบการนับ: #ok, # ok, ok, #จบ, จบ
     cleaned_lower = re.sub(r"^[#\s]+", "", text.lower()).strip()
     if cleaned_lower in ["ok", "จบ"]:
-        session = get_session(source_id)
-        if not session:
-            reply_line_message(
-                reply_token,
-                "ยังไม่มีรายการที่เปิดสะสมยอดครับ\nพิมพ์ #รวม หรือ #รวม <ชื่อสาขา> เพื่อเริ่มต้นส่งรูปครับ",
-            )
-            return
-
         # หากยังมีรูปภาพที่กำลังประมวลผลค้างอยู่ใน ThreadPool ให้รอให้เสร็จก่อน (สูงสุด 12 วิ)
         wait_for_pending(source_id, timeout=12.0)
 
-        # ดึงข้อมูลรอบล่าสุดหลังรูปประมวลผลเสร็จทั้งหมด
-        session = get_session(source_id) or session
-        slips = session.get("slips", [])
-        branch = session.get("branch", "")
-        session_date = session.get("date", datetime.now().strftime("%d/%m/%Y"))
+        session = get_session(source_id)
+        is_fallback = False
+
+        if session and session.get("slips"):
+            slips = session.get("slips", [])
+            branch = session.get("branch", "")
+            session_date = session.get("date", datetime.now().strftime("%d/%m/%Y"))
+            clear_session(source_id)
+        else:
+            # Fallback 1: ตรวจสอบจากฐานข้อมูลประวัติ recent_slips ในเครื่อง
+            recent = get_unsummarized_recent_slips(source_id, minutes=25)
+            if recent:
+                slips = recent
+                slip_ids = [s["id"] for s in recent]
+                mark_slips_summarized(source_id, slip_ids)
+                branch = session.get("branch", "") if session else ""
+                session_date = datetime.now().strftime("%d/%m/%Y")
+                is_fallback = True
+            else:
+                # Fallback 2: ดึงจาก Google Sheet โดยตรง (รองรับกรณี Server รีสตาร์ท หรือ Render Sleep)
+                sheet_slips = get_recent_slips_from_sheet(max_minutes=45)
+                if sheet_slips:
+                    slips = sheet_slips
+                    branch = sheet_slips[-1].get("branch", "") or (session.get("branch", "") if session else "")
+                    session_date = datetime.now().strftime("%d/%m/%Y")
+                    is_fallback = True
+                else:
+                    reply_line_message(
+                        reply_token,
+                        "ยังไม่มีรายการที่เปิดสะสมยอดครับ\nพิมพ์ #รวม หรือ #รวม <ชื่อสาขา> เพื่อเริ่มต้นส่งรูปครับ",
+                    )
+                    return
 
         total_amount = 0.0
         slip_lines = []
@@ -374,6 +514,8 @@ def handle_text_message(event):
         else:
             detail_text = "\n\n(ไม่พบสลิปโอนเงินที่ส่งเข้ามาระหว่างนี้)"
 
+        footer_hint = "\n(💡 ครั้งถัดไปพิมพ์ #รวม <สาขา> ก่อนส่งรูปได้ครับ)" if is_fallback else ""
+
         summary_msg = (
             f"📊 สรุปยอดเงินสลิป\n"
             f"-------------------------\n"
@@ -383,12 +525,10 @@ def handle_text_message(event):
             f"💰 ยอดรวมทั้งหมด: {total_amount:,.2f} บาท"
             f"{detail_text}\n"
             f"-------------------------\n"
-            f"บันทึกลง Google Sheets เรียบร้อยแล้วครับ"
+            f"บันทึกลง Google Sheets เรียบร้อยแล้วครับ{footer_hint}"
         )
 
-        clear_session(source_id)
-        log_event("SESSION_FINISH", f"สรุปยอดสาขา: '{branch}' {len(slips)} ใบ ยอด {total_amount:,.2f} บาท")
-
+        log_event("SESSION_FINISH", f"สรุปยอด (Fallback={is_fallback}): '{branch}' {len(slips)} ใบ ยอด {total_amount:,.2f} บาท")
         reply_line_message(reply_token, summary_msg)
         return
 
@@ -493,17 +633,55 @@ def process_image_worker(image_bytes: bytes, source_id: str, branch_name: str, i
             parsed_data.setdefault("ref_no", "-")
             parsed_data.setdefault("raw_text", "-")
 
-        # หากเป็นสลิป และอยู่ใน session ให้สะสมยอดเงิน
-        if parsed_data.get("category") == "สลิปโอนเงิน" and is_in_session:
+        # หากเป็นสลิป ให้สะสมยอดเงิน
+        if parsed_data.get("category") == "สลิปโอนเงิน":
             amt = clean_amount(parsed_data.get("amount"))
             rcv = str(parsed_data.get("receiver", "") or "").strip()
             t_date = str(parsed_data.get("trans_date", "") or "").strip()
             t_time = str(parsed_data.get("trans_time", "") or "").strip()
-            add_slip_to_session(source_id, amt, receiver=rcv, trans_date=t_date, trans_time=t_time)
-            log_event("SLIP_ADDED", f"บันทึกยอดสลิป: {amt:,.2f} บาท ({final_branch}) โอนไป: {rcv}")
+            # บันทึกลง recent_slips เสมอเพื่อรองรับกรณีผู้ใช้ไม่ได้พิมพ์ #รวม ก่อนส่งรูป
+            record_recent_slip(source_id, amt, receiver=rcv, trans_date=t_date, trans_time=t_time, branch=final_branch)
+            if is_in_session:
+                add_slip_to_session(source_id, amt, receiver=rcv, trans_date=t_date, trans_time=t_time)
+                log_event("SLIP_ADDED", f"บันทึกยอดสลิป: {amt:,.2f} บาท ({final_branch}) โอนไป: {rcv}")
+            else:
+                log_event("SLIP_AUTO_SAVED", f"บันทึกสลิปเตรียมพร้อม: {amt:,.2f} บาท โอนไป: {rcv}")
 
         # ส่งข้อมูลบันทึกลง Google Sheets
         send_to_google_sheet(parsed_data)
 
     except Exception as e:
-        log_event("I
+        log_event("IMAGE_ERR", f"เกิดข้อผิดพลาดในการประมวลผลรูป: {e}")
+    finally:
+        remove_pending(source_id)
+
+
+# ==========================================
+# จัดการรูปภาพที่ส่งเข้ามา (รับทันที แล้วโยนให้ Worker Pool)
+# ==========================================
+@handler.add(MessageEvent, message=ImageMessageContent)
+def handle_image_message(event):
+    message_id = event.message.id
+    source_id = get_source_id(event)
+    log_event("IMAGE_IN", f"ได้รับรูปภาพ id: {message_id} จาก {source_id}")
+
+    current_session = get_session(source_id)
+    branch_name = current_session.get("branch", "") if current_session else ""
+    is_in_session = bool(current_session)
+
+    with ApiClient(configuration) as api_client:
+        messaging_api_blob = MessagingApiBlob(api_client)
+        try:
+            image_bytes = messaging_api_blob.get_message_content(message_id)
+            # นับจำนวนรูปที่กำลังทำงาน และส่งให้ Worker ทำงานพร้อมๆ กันแบบคู่ขนาน (Non-blocking)
+            add_pending(source_id)
+            image_executor.submit(process_image_worker, image_bytes, source_id, branch_name, is_in_session)
+        except Exception as e:
+            log_event("DOWNLOAD_ERR", f"ดาวน์โหลดรูปภาพไม่สำเร็จ: {e}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
