@@ -549,8 +549,12 @@ PROMPT_FAST_SLIP = """คุณคือ AI อ่านสลิปโอนเ
 
 PROMPT_GENERAL = """คุณคือ AI วิเคราะห์รูปภาพและแยกหมวดหมู่สำหรับบันทึกลง Google Sheet
 วิเคราะห์ภาพนี้และจัดให้อยู่ใน 1 ใน 4 หมวดหมู่นี้:
-1. "สลิปโอนเงิน", 2. "ลงเวลาทำงาน", 3. "ส่งรายงาน", 4. "อื่นๆ"
-ตอบเป็น JSON สั้นๆ เท่านั้น:
+1. "สลิปโอนเงิน" (ดึง: amount, receiver, trans_date, trans_time)
+2. "ลงเวลาทำงาน" (ดึง: employee_name, work_date, work_time, work_type, location, raw_text)
+3. "ส่งรายงาน" (ดึง: reporter_name, report_title, summary, raw_text)
+4. "อื่นๆ" (ดึง: description, raw_text)
+
+ตอบเป็น JSON เท่านั้น:
 {
   "category": "หมวดหมู่ (สลิปโอนเงิน | ลงเวลาทำงาน | ส่งรายงาน | อื่นๆ)",
   "amount": "ยอดเงิน (กรณีสลิป)",
@@ -566,7 +570,8 @@ PROMPT_GENERAL = """คุณคือ AI วิเคราะห์รูป�
   "report_title": "หัวข้อรายงาน",
   "summary": "สรุปรายงาน",
   "branch": "ชื่อสาขา",
-  "description": "คำอธิบายภาพ"
+  "description": "คำอธิบายภาพว่าคืออะไร",
+  "raw_text": "ถอดข้อความและตัวเลขทั้งหมดที่อ่านได้จากภาพ (OCR)"
 }"""
 
 
@@ -633,6 +638,11 @@ def process_image_worker(image_bytes: bytes, source_id: str, branch_name: str, i
             parsed_data.setdefault("ref_no", "-")
             parsed_data.setdefault("raw_text", "-")
 
+        # ป้องกัน raw_text ว่าง สำหรับชีทอื่นๆ และรายงาน
+        raw_val = parsed_data.get("raw_text")
+        if not raw_val or str(raw_val).strip() in ["-", "ไม่มีข้อความ", "None"]:
+            parsed_data["raw_text"] = parsed_data.get("description") or "-"
+
         # หากเป็นสลิป ให้สะสมยอดเงิน
         if parsed_data.get("category") == "สลิปโอนเงิน":
             amt = clean_amount(parsed_data.get("amount"))
@@ -695,11 +705,17 @@ def process_image_worker(image_bytes: bytes, source_id: str, branch_name: str, i
                     f"(💡 หากต้องการรวมยอดหลายใบ ให้พิมพ์ #รวม ก่อนส่งรูปนะครับ)"
                 )
             else:
-                desc = parsed_data.get("description") or parsed_data.get("raw_text") or "อ่านข้อมูลจากภาพเรียบร้อย"
+                desc = parsed_data.get("description") or "อ่านข้อมูลจากภาพเรียบร้อย"
+                raw = str(parsed_data.get("raw_text") or "").strip()
+                extra_text = ""
+                if raw and raw != "-" and raw != desc:
+                    preview = raw[:300] + ("..." if len(raw) > 300 else "")
+                    extra_text = f"\n📝 ข้อความที่อ่านได้:\n{preview}"
                 reply_msg = (
                     f"✅ บันทึกข้อมูลรูปภาพเรียบร้อย\n"
                     f"-------------------------\n"
-                    f"📄 รายละเอียด: {desc}\n"
+                    f"📄 {desc}"
+                    f"{extra_text}\n"
                     f"-------------------------\n"
                     f"บันทึกลง Google Sheets แล้วครับ"
                 )
