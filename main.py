@@ -570,7 +570,7 @@ PROMPT_GENERAL = """คุณคือ AI วิเคราะห์รูป�
 }"""
 
 
-def process_image_worker(image_bytes: bytes, source_id: str, branch_name: str, is_in_session: bool):
+def process_image_worker(image_bytes: bytes, source_id: str, branch_name: str, is_in_session: bool, reply_token: str = ""):
     """ฟังก์ชันที่ทำงานใน Background Thread เพื่อประมวลผลรูปภาพพร้อมๆ กันหลายใบ"""
     try:
         # หากอยู่ใน session รวมยอดสลิป ให้ใช้ prompt สลิปแบบเร็วพิเศษ
@@ -650,6 +650,61 @@ def process_image_worker(image_bytes: bytes, source_id: str, branch_name: str, i
         # ส่งข้อมูลบันทึกลง Google Sheets
         send_to_google_sheet(parsed_data)
 
+        # หากส่งรูปเดี่ยวๆ (แบบไม่ได้เปิด session #รวม) ให้ตอบกลับยืนยันใน LINE ทันที
+        if not is_in_session and reply_token:
+            cat = parsed_data.get("category", "อื่นๆ")
+            if cat == "ลงเวลาทำงาน":
+                emp = parsed_data.get("employee_name") or "-"
+                w_time = parsed_data.get("work_time") or "-"
+                w_date = parsed_data.get("work_date") or "-"
+                loc = parsed_data.get("location") or parsed_data.get("branch") or "-"
+                reply_msg = (
+                    f"✅ บันทึกเวลาทำงานเรียบร้อย\n"
+                    f"-------------------------\n"
+                    f"👤 ชื่อ: {emp}\n"
+                    f"⏰ เวลา: {w_time} ({w_date})\n"
+                    f"📍 สถานที่: {loc}\n"
+                    f"-------------------------\n"
+                    f"บันทึกลง Google Sheets เรียบร้อยแล้วครับ"
+                )
+            elif cat == "ส่งรายงาน":
+                rep_title = parsed_data.get("report_title") or "-"
+                rep_name = parsed_data.get("reporter_name") or "-"
+                summary = parsed_data.get("summary") or "-"
+                reply_msg = (
+                    f"✅ บันทึกส่งรายงานเรียบร้อย\n"
+                    f"-------------------------\n"
+                    f"📋 หัวข้อ: {rep_title}\n"
+                    f"👤 ผู้ส่ง: {rep_name}\n"
+                    f"📝 สรุป: {summary}\n"
+                    f"-------------------------\n"
+                    f"บันทึกลง Google Sheets เรียบร้อยแล้วครับ"
+                )
+            elif cat == "สลิปโอนเงิน":
+                amt = clean_amount(parsed_data.get("amount"))
+                rcv = parsed_data.get("receiver") or "-"
+                t_time = parsed_data.get("trans_time") or "-"
+                reply_msg = (
+                    f"✅ บันทึกสลิปโอนเงินเรียบร้อย\n"
+                    f"-------------------------\n"
+                    f"💰 ยอดเงิน: {amt:,.2f} บาท\n"
+                    f"👤 โอนไป: {rcv}\n"
+                    f"⏰ เวลา: {t_time}\n"
+                    f"-------------------------\n"
+                    f"บันทึกลง Google Sheets เรียบร้อยแล้วครับ\n"
+                    f"(💡 หากต้องการรวมยอดหลายใบ ให้พิมพ์ #รวม ก่อนส่งรูปนะครับ)"
+                )
+            else:
+                desc = parsed_data.get("description") or parsed_data.get("raw_text") or "อ่านข้อมูลจากภาพเรียบร้อย"
+                reply_msg = (
+                    f"✅ บันทึกข้อมูลรูปภาพเรียบร้อย\n"
+                    f"-------------------------\n"
+                    f"📄 รายละเอียด: {desc}\n"
+                    f"-------------------------\n"
+                    f"บันทึกลง Google Sheets แล้วครับ"
+                )
+            reply_line_message(reply_token, reply_msg)
+
     except Exception as e:
         log_event("IMAGE_ERR", f"เกิดข้อผิดพลาดในการประมวลผลรูป: {e}")
     finally:
@@ -663,6 +718,7 @@ def process_image_worker(image_bytes: bytes, source_id: str, branch_name: str, i
 def handle_image_message(event):
     message_id = event.message.id
     source_id = get_source_id(event)
+    reply_token = event.reply_token
     log_event("IMAGE_IN", f"ได้รับรูปภาพ id: {message_id} จาก {source_id}")
 
     current_session = get_session(source_id)
@@ -675,7 +731,7 @@ def handle_image_message(event):
             image_bytes = messaging_api_blob.get_message_content(message_id)
             # นับจำนวนรูปที่กำลังทำงาน และส่งให้ Worker ทำงานพร้อมๆ กันแบบคู่ขนาน (Non-blocking)
             add_pending(source_id)
-            image_executor.submit(process_image_worker, image_bytes, source_id, branch_name, is_in_session)
+            image_executor.submit(process_image_worker, image_bytes, source_id, branch_name, is_in_session, reply_token)
         except Exception as e:
             log_event("DOWNLOAD_ERR", f"ดาวน์โหลดรูปภาพไม่สำเร็จ: {e}")
 
